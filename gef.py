@@ -81,6 +81,8 @@ import tempfile
 import time
 import traceback
 
+sys.path.append(os.path.dirname(os.path.abspath(os.path.expanduser(__file__))))
+import highlighter as H
 
 PYTHON_MAJOR = sys.version_info[0]
 
@@ -7235,13 +7237,15 @@ class ContextCommand(GenericCommand):
     states, the stack, and the disassembly code around $pc."""
 
     _cmdline_ = "context"
-    _syntax_  = "{:s} [legend|regs|stack|code|args|memory|source|trace|threads|extra]".format(_cmdline_)
+    _syntax_  = "{:s} [legend|regs|stack|code|args|memory|source|trace|threads|extra|srcasm]".format(_cmdline_)
     _aliases_ = ["ctx",]
 
     old_registers = {}
 
     def __init__(self):
         super(ContextCommand, self).__init__()
+        # CHANGED remove nb_lines constraint when directly use "context stack" etc.
+        self.is_layout_invoking = False
         self.add_setting("enable", True, "Enable/disable printing the context when breaking")
         self.add_setting("show_stack_raw", False, "Show the stack pane as raw hexdump (no dereference)")
         self.add_setting("show_registers_raw", False, "Show the registers pane with raw values (no dereference)")
@@ -7259,7 +7263,7 @@ class ContextCommand(GenericCommand):
         self.add_setting("redirect", "", "Redirect the context information to another TTY")
 
         if "capstone" in list(sys.modules.keys()):
-            self.add_setting("use_capstone", False, "Use capstone as disassembler in the code pane (instead of GDB)")
+            self.add_setting("use_capstone", True, "Use capstone as disassembler in the code pane (instead of GDB)")
 
         self.layout_mapping = {
             "legend":  self.show_legend,
@@ -7272,6 +7276,7 @@ class ContextCommand(GenericCommand):
             "trace": self.context_trace,
             "threads": self.context_threads,
             "extra": self.context_additional_information,
+            "srcasm": self.context_srcasm   # source and asm side by side
         }
         return
 
@@ -7306,8 +7311,13 @@ class ContextCommand(GenericCommand):
             return
 
         if len(argv) > 0:
+            self.is_layout_invoking = False
             current_layout = argv
         else:
+            # CHANGED a hack to ensure stack, threads, and backtrace aren't constrainted
+            # by the nb_lines settings, when they are invoked directly rather than
+            # as part of context
+            self.is_layout_invoking = True
             current_layout = self.get_setting("layout").strip().split()
 
         if not current_layout:
@@ -7333,6 +7343,7 @@ class ContextCommand(GenericCommand):
                 err(str(e))
 
 
+        self.is_layout_invoking = False
         self.context_title("")
 
         if redirect and os.access(redirect, os.W_OK):
@@ -7433,6 +7444,8 @@ class ContextCommand(GenericCommand):
 
         show_raw = self.get_setting("show_stack_raw")
         nb_lines = self.get_setting("nb_lines_stack")
+        if not self.is_layout_invoking:
+            nb_lines = 20
 
         try:
             sp = current_arch.sp
@@ -7636,7 +7649,8 @@ class ContextCommand(GenericCommand):
         return
 
 
-    def context_source(self):
+    def get_context_source_output(self, nb_line):
+        results = []
         try:
             pc = current_arch.pc
             symtabline = gdb.find_pc_line(pc)
@@ -7646,40 +7660,55 @@ class ContextCommand(GenericCommand):
                 return
 
             fpath = symtab.fullname()
-            with open(fpath, "r") as f:
-                lines = [l.rstrip() for l in f.readlines()]
+            lines, raw_lines = H.highlight_file(fpath)
+            # with open(fpath, "r") as f:
+            #     lines = [l.rstrip() for l in f.readlines()]
 
         except Exception:
             return
 
-        nb_line = self.get_setting("nb_lines_code")
         fn = symtab.filename
-        if len(fn) > 20:
-            fn = "{}[...]{}".format(fn[:15], os.path.splitext(fn)[1])
-        title = "source:{}+{}".format(fn, line_num + 1)
         cur_line_color = get_gef_setting("theme.source_current_line")
-        self.context_title(title)
 
-        for i in range(line_num - nb_line + 1, line_num + nb_line):
+        for i in range(line_num - nb_line + 3, line_num + nb_line):
             if i < 0:
                 continue
 
             if i < line_num:
-                gef_print(Color.grayify("   {:4d}\t {:s}".format(i + 1, lines[i],)))
+                if raw_lines[i].strip() != "":
+                    results.append((Color.grayify("   {:4d}\t {:s}".format(i + 1, raw_lines[i],))))
 
             if i == line_num:
-                extra_info = self.get_pc_context_info(pc, lines[i])
+                extra_info = self.get_pc_context_info(pc, raw_lines[i])
                 prefix = "{}{:4d}\t ".format(RIGHT_ARROW, i + 1)
                 leading = len(lines[i]) - len(lines[i].lstrip())
+                line_str = "{}{:s}".format(Color.colorify(prefix, cur_line_color), lines[i])
                 if extra_info:
-                    gef_print("{}{}".format(" "*(len(prefix) + leading), extra_info))
-                gef_print(Color.colorify("{}{:s}".format(prefix, lines[i]), cur_line_color))
+                    #line_str = "{}    {} {}".format(line_str,
+                    #    Color.colorify(LEFT_ARROW, cur_line_color), extra_info)
+                    results.append("{}{}".format(" "*(len(prefix) + leading), extra_info))
+                #results.append(line_str)
+                results.append(Color.colorify("{}{:s}".format(prefix, lines[i]), cur_line_color))
 
             if i > line_num:
                 try:
-                    gef_print("   {:4d}\t {:s}".format(i + 1, lines[i],))
+                    results.append("   {:4d}\t {:s}".format(i + 1, lines[i],))
                 except IndexError:
                     break
+        return fn, line_num, results
+
+    def context_source(self):
+        nb_line = self.get_setting("nb_lines_code")
+        fn, line_num, lines = self.get_context_source_output(nb_line)
+        if len(fn) > 80:
+            fn = "{}[...]{}".format(fn[:75], os.path.splitext(fn)[1])
+        title = "source:{}+{}".format(fn, line_num + 1)
+        self.context_title(title)
+        for line in lines:
+            gef_print(line)
+
+
+    def context_srcasm(self):
         return
 
     def get_pc_context_info(self, pc, line):
@@ -7719,6 +7748,8 @@ class ContextCommand(GenericCommand):
         self.context_title("trace")
 
         nb_backtrace = self.get_setting("nb_lines_backtrace")
+        if not self.is_layout_invoking:
+            nb_backtrace = 100
         if nb_backtrace <= 0:
             return
         orig_frame = current_frame = gdb.selected_frame()
@@ -7740,9 +7771,11 @@ class ContextCommand(GenericCommand):
             items.append("{:#x}".format(pc))
             if name:
                 frame_args = gdb.FrameDecorator.FrameDecorator(current_frame).frame_args() or []
+                # CHANGED: make it single line output instead of multipe line
+                # which wastes a lot of vertical spaces
                 m = "{}({})".format(Color.greenify(name),
-                                    ", ".join(["{}={!s}".format(Color.yellowify(x.sym),
-                                                                x.sym.value(current_frame)) for x in frame_args]))
+                                    ", ".join([re.sub(r'\s+', ' ', "{}={!s}".format(Color.yellowify(x.sym),
+                                                                x.sym.value(current_frame)).replace("\n", " ")) for x in frame_args]))
                 items.append(m)
             else:
                 try:
@@ -7783,10 +7816,13 @@ class ContextCommand(GenericCommand):
 
             return "STOPPED"
 
-        self.context_title("threads")
 
         threads = gdb.selected_inferior().threads()[::-1]
+        num_threads = len(threads)
+        self.context_title("{} threads".format(num_threads))
         idx = self.get_setting("nb_lines_threads")
+        if not self.is_layout_invoking:
+            idx = num_threads
         if idx > 0:
             threads = threads[0:idx]
 
@@ -7800,7 +7836,7 @@ class ContextCommand(GenericCommand):
         selected_thread = gdb.selected_thread()
 
         for i, thread in enumerate(threads):
-            line = """[{:s}] Id {:d}, """.format(Color.colorify("#{:d}".format(i), "bold green" if thread==selected_thread  else "bold pink"), thread.num)
+            line = """[{:s}] Id {:d}, """.format(Color.colorify("#{:d}/{:d}".format(i, num_threads), "bold green" if thread==selected_thread  else "bold pink"), thread.num)
             if thread.name:
                 line += """Name: "{:s}", """.format(thread.name)
             if thread.is_running():
