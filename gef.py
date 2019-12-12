@@ -7261,6 +7261,7 @@ class ContextCommand(GenericCommand):
         self.add_setting("clear_screen", False, "Clear the screen before printing the context")
         self.add_setting("layout", "legend regs stack code args source memory threads trace extra", "Change the order/presence of the context sections")
         self.add_setting("redirect", "", "Redirect the context information to another TTY")
+        self.add_setting("test", 100, "test")
 
         if "capstone" in list(sys.modules.keys()):
             self.add_setting("use_capstone", True, "Use capstone as disassembler in the code pane (instead of GDB)")
@@ -7697,6 +7698,42 @@ class ContextCommand(GenericCommand):
                     break
         return fn, line_num, results
 
+    def wrap_lines(self, lines, width, border_end=None):
+        results = []
+        s_clear = '\033[0m'
+        for line in lines:
+            parts = re.split(r'(\033\[[^m]+m)', line)
+            s = ""
+            length = 0
+            colors=""
+            for p in parts:
+                if p.startswith('\033'):
+                    s += p
+                    if p == s_clear:
+                        colors = ''
+                    else:
+                        colors += p
+                    continue
+                while length + len(p) > width:
+                    s += p[:width - length]
+                    if border_end:
+                        results.append(s + s_clear + border_end)
+                    else:
+                        results.append(s + s_clear)
+                    p = p[width - length:]
+                    s = colors
+                    length = 0
+                length += len(p)
+                s += p
+            if length > 0:
+                if border_end:
+                    s += ' ' * (width - length)
+                    results.append(s + s_clear + border_end)
+                else:
+                    results.append(s + s_clear)
+        return results
+
+
     def context_source(self):
         nb_line = self.get_setting("nb_lines_code")
         fn, line_num, lines = self.get_context_source_output(nb_line)
@@ -7707,9 +7744,18 @@ class ContextCommand(GenericCommand):
         for line in lines:
             gef_print(line)
 
-
     def context_srcasm(self):
-        return
+        nb_line = self.get_setting("nb_lines_code")
+        fn, line_num, lines = self.get_context_source_output(nb_line)
+        if len(fn) > 80:
+            fn = "{}[...]{}".format(fn[:75], os.path.splitext(fn)[1])
+        title = "srcasm:{}+{}".format(fn, line_num + 1)
+        self.context_title(title)
+        www = int(self.get_setting("test"))
+        lines = self.wrap_lines(lines, www, Color.grayify("  " + VERTICAL_LINE))
+        for line in lines:
+            gef_print(line)
+
 
     def get_pc_context_info(self, pc, line):
         try:
