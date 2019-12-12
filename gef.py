@@ -717,9 +717,26 @@ class Instruction:
 
         code = "{:6s} {:s}".format(self.mnemonic, ", ".join(operands))
         if highlight:
-            code = H.highlight_asm(code)
+            # highlight and replace the color <..>
+            # remove the spaces in <..>
+            parts = re.split(r'(<.*>)', code)
+            for i, p in enumerate(parts):
+                if p.startswith('<') and p.endswith('>'):
+                    parts[i] = "".join(p.split())
+            code = "".join(parts)
+            highlighted_code = H.highlight_asm(code)
+            # then replace the <> with our format
+            raw_parts = code.split()
+            parts = highlighted_code.split()
+            for i, p in enumerate(raw_parts):
+                if p.startswith('<') and p.endswith('>'):
+                    parts[i] = Color.pinkify(p)
+            # op need aligned
+            parts[0] = Color.yellowify("{:6s}".format(self.mnemonic))
+            code = " ".join(parts)
+
         if loc_length:
-            return "{:#10x} {}     {:s}".format(self.address, location, code)
+            return "{:#10x} {}  {:s}".format(self.address, location, code)
         return "{:#10x} {:16} {:s}".format(self.address, location, code)
 
     def is_valid(self):
@@ -6673,6 +6690,12 @@ class DetailRegistersCommand(GenericCommand):
 
     @only_if_gdb_running
     def do_invoke(self, argv):
+        lines = DetailRegistersCommand.get_registers_info(argv)
+        for l in lines:
+            gef_print(l)
+
+    def get_registers_info(argv):
+        results = []
         unchanged_color = get_gef_setting("theme.registers_register_name")
         changed_color = get_gef_setting("theme.registers_value_changed")
         string_color = get_gef_setting("theme.dereference_string")
@@ -6701,7 +6724,7 @@ class DetailRegistersCommand(GenericCommand):
             if str(reg) == "<unavailable>":
                 line = "{}: ".format(Color.colorify(padreg, unchanged_color))
                 line += Color.colorify("no value", "yellow underline")
-                gef_print(line)
+                results.append(line)
                 continue
 
             value = align_address(long(reg))
@@ -6721,7 +6744,7 @@ class DetailRegistersCommand(GenericCommand):
 
             if regname == current_arch.flag_register:
                 line += current_arch.flag_register_to_human()
-                gef_print(line)
+                results.append(line)
                 continue
 
             addr = lookup_address(align_address(long(value)))
@@ -6746,11 +6769,11 @@ class DetailRegistersCommand(GenericCommand):
             except ValueError:
                 pass
 
-            gef_print(line)
+            results.append(line)
 
         if special_line:
-            gef_print(special_line)
-        return
+            results.append(special_line)
+        return results
 
 
 @register_command
@@ -7323,6 +7346,7 @@ class ContextCommand(GenericCommand):
         self.layout_mapping = {
             "legend":  self.show_legend,
             "regs":  self.context_regs,
+            "wregs":  self.context_wregs,
             "stack": self.context_stack,
             "code": self.context_code,
             "args": self.context_args,
@@ -7424,6 +7448,20 @@ class ContextCommand(GenericCommand):
                                 line_color)
         gef_print(title)
         return
+
+    def context_wregs(self):    # regs in windows
+        self.context_title("registers")
+        ignored_registers = set(self.get_setting("ignore_registers").split())
+
+        regs = set(current_arch.all_registers)
+        printable_registers = " ".join(list(regs - ignored_registers))
+
+        lines = DetailRegistersCommand.get_registers_info(printable_registers)
+        # on IA, the last two lines are flags related
+        self.split_print_lines(lines[:-2], new_line_indent=9)
+        for l in lines[-2:]:
+            gef_print(l)
+
 
     def context_regs(self):
         self.context_title("registers")
@@ -7728,7 +7766,7 @@ class ContextCommand(GenericCommand):
             symtab = symtabline.symtab
             line_num = symtabline.line - 1     # we substract one because line number returned by gdb start at 1
             if not symtab.is_valid():
-                return
+                return "__UNKNOWN_FILE__", 0, results, []
 
             fpath = symtab.fullname()
             lines, raw_lines = H.highlight_file(fpath)
@@ -7736,7 +7774,7 @@ class ContextCommand(GenericCommand):
             #     lines = [l.rstrip() for l in f.readlines()]
 
         except Exception as e:
-            return "__UNKNOWN_FILE__", 0, results
+            return "__UNKNOWN_FILE__", 0, results, []
 
         fn = symtab.filename
         cur_line_color = get_gef_setting("theme.source_current_line")
@@ -7777,7 +7815,7 @@ class ContextCommand(GenericCommand):
                     results.append("   {:4d}\t {:s}".format(i + 1, lines[i],))
                 except IndexError:
                     break
-        return fn, line_num, results
+        return fn, line_num, results, raw_lines
 
     def print_ruler(self):
         cols = get_terminal_size()[1]
@@ -7788,7 +7826,7 @@ class ContextCommand(GenericCommand):
         s += '-' * (cols - len(s))
         gef_print(s)
 
-    def wrap_lines(self, lines, width, border_end=None):
+    def wrap_lines(self, lines, width, border_end=None, new_line_indent=0):
         results = []
         s_clear = '\033[0m'
         colors=""
@@ -7806,29 +7844,47 @@ class ContextCommand(GenericCommand):
                     else:
                         colors += p
                     continue
-                while length + len(p) > width:
-                    s += p[:width - length]
+                indent = 0      # no need idention for normal line
+                while length + len(p) + indent > width:
+                    s += p[:width - length - indent]
                     if border_end:
                         results.append(s + s_clear + border_end)
                     else:
                         results.append(s + s_clear)
-                    p = p[width - length:]
-                    s = colors
+                    p = p[width - length - indent:]
+                    indent = new_line_indent
+                    s = ' ' * indent + colors
                     length = 0
-                length += len(p)
+                length += len(p) + indent
                 s += p
             if length > 0:
-                if border_end:
+                if border_end is not None:
                     s += ' ' * (width - length)
                     results.append(s + s_clear + border_end)
                 else:
                     results.append(s + s_clear)
         return results
 
+    def split_print_lines(self, lines, new_line_indent=0):
+        cols = get_terminal_size()[1]
+        left_size = cols // 2 - 2
+        right_size = cols - left_size - 5
+        line_split = len(lines) // 2
+        left_lines = self.wrap_lines(lines[:line_split], left_size, '', new_line_indent=new_line_indent)
+        right_lines = self.wrap_lines(lines[line_split:], right_size, new_line_indent=new_line_indent)
+        height = max(len(left_lines), len(right_lines))
+        for _ in range(height - len(left_lines)):
+            left_lines.append(' ' * left_size)
+        for _ in range(height - len(right_lines)):
+            right_lines.append(' ' * right_size)
+        s = '  ' + Color.grayify(VERTICAL_LINE) + '  '
+        for i in range(height):
+            gef_print(left_lines[i] + s + right_lines[i])
+
 
     def context_source(self):
         nb_line = self.get_setting("nb_lines_code")
-        fn, line_num, lines = self.get_context_source_output(nb_line)
+        fn, line_num, lines, _ = self.get_context_source_output(nb_line)
         if len(fn) > 80:
             fn = "{}[...]{}".format(fn[:75], os.path.splitext(fn)[1])
         title = "source:{}+{}".format(fn, line_num + 1)
@@ -7840,15 +7896,25 @@ class ContextCommand(GenericCommand):
         #self.print_ruler()
         _, cols = get_terminal_size()
 
-        src_width = cols // 2 - 1
-        asm_width = cols - src_width - 1
 
         nb_line = self.get_setting("nb_lines_srcasm")
-        fn, line_num, lines = self.get_context_source_output(nb_line)
+        fn, line_num, lines, raw_lines = self.get_context_source_output(nb_line)
         if len(fn) > 80:
             fn = "{}[...]{}".format(fn[:75], os.path.splitext(fn)[1])
         title = "srcasm:{}+{}".format(fn, line_num + 1)
         self.context_title(title)
+
+        src_width = cols // 2 - 1
+        # typically the length of source code line is 80, plus lineno, spaces should be <90
+        if src_width > 90:
+            n_long_line = 0
+            for l in raw_lines:
+                if len(l) > 80:
+                    n_long_line += 1
+            if n_long_line <= 3:
+                src_width = 90
+        asm_width = cols - src_width - 1
+
 
         for _ in range(nb_line - len(lines)):
             lines.append(' ')
