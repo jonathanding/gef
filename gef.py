@@ -658,18 +658,69 @@ class Elf:
             self.e_shentsize, self.e_shnum, self.e_shstrndx = struct.unpack("{}HHH".format(endian), fd.read(6))
         return
 
+def get_shorter_location(loc, length=20, remove_enclosing=True):
+    if length < 8:
+        length = 8
+    # remove <, > and the function parameters
+    if remove_enclosing:
+        l = re.sub(r'<(.*)>', r'\1', loc)
+    l = re.sub(r'\(.*\)', '', l)
+    if len(l) > length:
+        parts = l.split('::')
+        l = parts.pop()
+        while len(parts) > 0:
+            p = parts.pop() + '::'
+            if len(p) > length - len(l) - 5: # for ...::
+                break
+            l = p + l
+    return l
 
 class Instruction:
     """GEF representation of a CPU instruction."""
     def __init__(self, address, location, mnemo, operands):
         self.address, self.location, self.mnemonic, self.operands = address, location, mnemo, operands
+        self.normalized_operands = self._normalize_operands()
+        self.short_location = None
         return
 
     def __str__(self):
         return "{:#10x} {:16} {:6} {:s}".format(self.address,
                                                 self.location,
                                                 self.mnemonic,
-                                                ", ".join(self.operands))
+                                                ", ".join(self.normalized_operands()))
+    def _normalize_operands(self):
+        operands = []
+        for s in self.operands:
+            # pygment doesn't recognize "QWORD PTR" etc., need to be "qword ptr"
+            s = " ".join([x.lower() if x.isupper() else x for x in s.split()])
+            # pygment cannot colorify the 0x10 in "rbp-0x10", need to be "rbp - 0x10"
+            s = re.sub(r'([^-+*/])(\+|-|\*|/)([^-+*/])', r'\1 \2 \3', s)
+            # reduce the spaces before the comment started with #
+            s = re.sub(r'\s+(#.*)', r'  \1', s)
+            operands.append(s)
+        self.normalized_operands = operands
+        return operands
+
+    def shorter_location(self, length=20):
+        l = get_shorter_location(self.location, length, True)
+        self.short_location = l
+        return l
+
+
+    def formatted_str(self, loc_length=None, highlight=True):
+        operands = self.normalized_operands
+        if loc_length is None:
+            location = self.location
+        else:
+            location = self.short_location if self.short_location is not None else self.shorter_location()
+            location += ' ' * (loc_length - len(location))
+
+        code = "{:6s} {:s}".format(self.mnemonic, ", ".join(operands))
+        if highlight:
+            code = H.highlight_asm(code)
+        if loc_length:
+            return "{:#10x} {}     {:s}".format(self.address, location, code)
+        return "{:#10x} {:16} {:s}".format(self.address, location, code)
 
     def is_valid(self):
         return "(bad)" not in self.mnemonic
@@ -3905,6 +3956,8 @@ class GenericCommand(gdb.Command):
                 show_last_exception()
             else:
                 err("Command '{:s}' failed to execute properly, reason: {:s}".format(self._cmdline_, str(e)))
+                err(traceback.format_exc())
+
         return
 
     def usage(self):
@@ -7261,6 +7314,7 @@ class ContextCommand(GenericCommand):
         self.add_setting("clear_screen", False, "Clear the screen before printing the context")
         self.add_setting("layout", "legend regs stack code args source memory threads trace extra", "Change the order/presence of the context sections")
         self.add_setting("redirect", "", "Redirect the context information to another TTY")
+        self.add_setting("nb_lines_srcasm", 8, "Size of srcasm pane")
         self.add_setting("test", 100, "test")
 
         if "capstone" in list(sys.modules.keys()):
@@ -7466,7 +7520,7 @@ class ContextCommand(GenericCommand):
         nb_insn_prev = self.get_setting("nb_lines_code_prev")
         use_capstone = self.has_setting("use_capstone") and self.get_setting("use_capstone")
         cur_insn_color = get_gef_setting("theme.disassemble_current_instruction")
-        pc = current_arch.pc
+        lines = self.get_context_code_output(nb_insn, nb_insn_prev, use_capstone, cur_insn_color)
 
         frame = gdb.selected_frame()
         arch = frame.architecture()
@@ -7474,17 +7528,32 @@ class ContextCommand(GenericCommand):
 
         self.context_title("code:{}".format(arch_name))
 
+        for l in lines:
+            gef_print(l)
+
+    def get_context_code_output(self, nb_insn, nb_insn_prev, use_capstone, cur_insn_color, loc_length=None):
+        results = []
+        pc = current_arch.pc
+        frame = gdb.selected_frame()
+
         try:
             instruction_iterator = capstone_disassemble if use_capstone else gef_disassemble
+            instructions = [i for i in instruction_iterator(pc, nb_insn, nb_prev=nb_insn_prev)]
+            max_len = 0
+            if loc_length is not None:
+                for insn in instructions:
+                    max_len = max(max_len, len(insn.shorter_location()))
+                loc_length = max_len
 
-            for insn in instruction_iterator(pc, nb_insn, nb_prev=nb_insn_prev):
+            for insn in instructions:
                 line = []
                 is_taken  = False
                 target    = None
-                text = str(insn)
+                raw_text = insn.formatted_str(loc_length, False)
+                text = insn.formatted_str(loc_length)
 
                 if insn.address < pc:
-                    line += Color.grayify("   {}".format(text))
+                    line += Color.grayify("   {}".format(raw_text))
 
                 elif insn.address == pc:
                     line += Color.colorify("{:s}{:s}".format(RIGHT_ARROW, text), cur_insn_color)
@@ -7506,7 +7575,7 @@ class ContextCommand(GenericCommand):
                 else:
                     line += "   {}".format(text)
 
-                gef_print("".join(line))
+                results.append("".join(line))
 
                 if target:
                     try:
@@ -7517,13 +7586,14 @@ class ContextCommand(GenericCommand):
                         # If the operand isn't an address right now we can't parse it
                         continue
                     for i, tinsn in enumerate(instruction_iterator(target, nb_insn)):
-                        text= "   {}  {}".format (DOWN_ARROW if i==0 else " ", str(tinsn))
-                        gef_print(text)
+                        text= "   {}  {}".format (DOWN_ARROW if i==0 else " ", tinsn.formatted_str(loc_length))
+                        results.append(text)
                     break
 
         except gdb.MemoryError:
             err("Cannot disassemble from $PC")
-        return
+            return results
+        return results
 
     def context_args(self):
         insn = gef_current_instruction(current_arch.pc)
@@ -7665,13 +7735,24 @@ class ContextCommand(GenericCommand):
             # with open(fpath, "r") as f:
             #     lines = [l.rstrip() for l in f.readlines()]
 
-        except Exception:
-            return
+        except Exception as e:
+            return "__UNKNOWN_FILE__", 0, results
 
         fn = symtab.filename
         cur_line_color = get_gef_setting("theme.source_current_line")
 
-        for i in range(line_num - nb_line + 3, line_num + nb_line):
+        prev_lines = nb_line // 2 - 3
+        if prev_lines < 3:
+            prev_lines = 3 if line_num > 3 else line_num
+        next_lines = nb_line - prev_lines
+        file_length = len(raw_lines)
+        if line_num + next_lines > file_length:
+            next_lines = file_length - line_num
+            prev_lines = nb_line - next_lines - 3  # -3 to leave some buffer for multipe line
+            if line_num - prev_lines < 0:
+                prev_lines = line_num
+
+        for i in range(line_num - prev_lines, line_num + next_lines):
             if i < 0:
                 continue
 
@@ -7698,14 +7779,25 @@ class ContextCommand(GenericCommand):
                     break
         return fn, line_num, results
 
+    def print_ruler(self):
+        cols = get_terminal_size()[1]
+        s = ""
+        for i in range(cols//10):
+            x = str(i)
+            s += x + '-'*(10 - len(x))
+        s += '-' * (cols - len(s))
+        gef_print(s)
+
     def wrap_lines(self, lines, width, border_end=None):
         results = []
         s_clear = '\033[0m'
+        colors=""
+        if border_end is not None:
+            width -= len(re.sub(r'(\033\[[^m]+m)', '', border_end))
         for line in lines:
             parts = re.split(r'(\033\[[^m]+m)', line)
             s = ""
             length = 0
-            colors=""
             for p in parts:
                 if p.startswith('\033'):
                     s += p
@@ -7745,16 +7837,38 @@ class ContextCommand(GenericCommand):
             gef_print(line)
 
     def context_srcasm(self):
-        nb_line = self.get_setting("nb_lines_code")
+        #self.print_ruler()
+        _, cols = get_terminal_size()
+
+        src_width = cols // 2 - 1
+        asm_width = cols - src_width - 1
+
+        nb_line = self.get_setting("nb_lines_srcasm")
         fn, line_num, lines = self.get_context_source_output(nb_line)
         if len(fn) > 80:
             fn = "{}[...]{}".format(fn[:75], os.path.splitext(fn)[1])
         title = "srcasm:{}+{}".format(fn, line_num + 1)
         self.context_title(title)
-        www = int(self.get_setting("test"))
-        lines = self.wrap_lines(lines, www, Color.grayify("  " + VERTICAL_LINE))
-        for line in lines:
-            gef_print(line)
+
+        for _ in range(nb_line - len(lines)):
+            lines.append(' ')
+
+        left_lines = self.wrap_lines(lines, src_width, Color.grayify("  " + VERTICAL_LINE))
+
+        nb_insn = nb_line
+        nb_insn_prev = self.get_setting("nb_lines_code_prev")
+        use_capstone = self.has_setting("use_capstone") and self.get_setting("use_capstone")
+        cur_insn_color = get_gef_setting("theme.disassemble_current_instruction")
+        lines = self.get_context_code_output(nb_insn, nb_insn_prev, use_capstone, cur_insn_color, 20)
+
+        for _ in range(nb_line - len(lines)):
+            lines.append(' ')
+
+
+        right_lines = self.wrap_lines(lines, asm_width)
+
+        for i in range(nb_line):
+            gef_print(left_lines[i] + right_lines[i])
 
 
     def get_pc_context_info(self, pc, line):

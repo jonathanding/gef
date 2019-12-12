@@ -12,7 +12,10 @@ def highlight_file(filename):
 
     source_lines = source.splitlines()
     return [line.rstrip() for line in source_lines], [line.rstrip() for line in raw_lines]
-    
+
+def highlight_asm(code):
+    return HH.syntax_highlight(code, filename=".asm")
+
 
 
 

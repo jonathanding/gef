@@ -63,7 +63,7 @@ def generateColorFunctionInner(old, new):
 
 def generateColorFunction(config):
     function = lambda x: x
-    
+
     for color in config.split(','):
         function = generateColorFunctionInner(function, globals()[color.lower().replace('-', '_')])
     return function
