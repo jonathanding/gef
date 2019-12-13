@@ -7338,6 +7338,7 @@ class ContextCommand(GenericCommand):
         self.add_setting("layout", "legend regs stack code args source memory threads trace extra", "Change the order/presence of the context sections")
         self.add_setting("redirect", "", "Redirect the context information to another TTY")
         self.add_setting("nb_lines_srcasm", 8, "Size of srcasm pane")
+        self.add_setting("nb_lines_standalone", 36, "Lines for various command when not invoked by layout")
         self.add_setting("test", 100, "test")
 
         if "capstone" in list(sys.modules.keys()):
@@ -7536,9 +7537,10 @@ class ContextCommand(GenericCommand):
         self.context_title("stack")
 
         show_raw = self.get_setting("show_stack_raw")
-        nb_lines = self.get_setting("nb_lines_stack")
-        if not self.is_layout_invoking:
-            nb_lines = 20
+        if self.is_layout_invoking:
+            nb_lines = self.get_setting("nb_lines_stack")
+        else:
+            nb_lines = self.get_setting("nb_lines_standalone")
 
         try:
             sp = current_arch.sp
@@ -7554,7 +7556,10 @@ class ContextCommand(GenericCommand):
         return
 
     def context_code(self):
-        nb_insn = self.get_setting("nb_lines_code")
+        if self.is_layout_invoking:
+            nb_insn = self.get_setting("nb_lines_code")
+        else:
+            nb_insn = self.get_setting("nb_lines_standalone")
         nb_insn_prev = self.get_setting("nb_lines_code_prev")
         use_capstone = self.has_setting("use_capstone") and self.get_setting("use_capstone")
         cur_insn_color = get_gef_setting("theme.disassemble_current_instruction")
@@ -7609,6 +7614,31 @@ class ContextCommand(GenericCommand):
                         target = insn.operands[-1].split()[0]
                     elif current_arch.is_ret(insn) and self.get_setting("peek_ret") is True:
                         target = current_arch.get_ra(insn, frame)
+                    elif insn.mnemonic == 'jmp': # special handling for IA
+                        # it might have an address added as comment by GDB at the end
+                        # for indirect-jump, e.g. jmp [rip+ 0x12]  # 0x666888
+                        addrs = re.findall(r'#\s*(0x[0-9a-f]+)$', insn.operands[-1])
+                        if addrs:
+                            addr = addrs[-1]
+                            addr = int(addr, 16)
+                            addrs = DereferenceCommand.dereference_from(addr)
+                            if len(addrs) > 1:
+                                # the first one in addrs is the location to storethe jump target
+                                # so need to use the 2nd one
+                                addr = addrs[1]
+                                # this target has been formated, so need to remove the format
+                                addrs = re.findall(r'0x[0-9a-f]+', addr)
+                                if addrs:
+                                    target = addrs[0]
+                        else:  # is direct far jump
+                            addrs = re.findall(r'^\s*(0x[0-9a-f]+)', insn.operands[0])
+                            if addrs:
+                                addr = addrs[0]
+                                vaddr = int(addr, 16)
+                                # FIXME: not sure yet how to distinguish relative and aboslute jmp
+                                # currently simply avoid short jmp
+                                if vaddr > 128:
+                                    target = addr
 
                 else:
                     line += "   {}".format(text)
@@ -7883,7 +7913,10 @@ class ContextCommand(GenericCommand):
 
 
     def context_source(self):
-        nb_line = self.get_setting("nb_lines_code")
+        if self.is_layout_invoking:
+            nb_line = self.get_setting("nb_lines_code")
+        else:
+            nb_line = self.get_setting("nb_lines_standalone")
         fn, line_num, lines, _ = self.get_context_source_output(nb_line)
         if len(fn) > 80:
             fn = "{}[...]{}".format(fn[:75], os.path.splitext(fn)[1])
@@ -7897,7 +7930,10 @@ class ContextCommand(GenericCommand):
         _, cols = get_terminal_size()
 
 
-        nb_line = self.get_setting("nb_lines_srcasm")
+        if self.is_layout_invoking:
+            nb_line = self.get_setting("nb_lines_srcasm")
+        else:
+            nb_line = self.get_setting("nb_lines_standalone")
         fn, line_num, lines, raw_lines = self.get_context_source_output(nb_line)
         if len(fn) > 80:
             fn = "{}[...]{}".format(fn[:75], os.path.splitext(fn)[1])
@@ -8119,6 +8155,45 @@ class ContextCommand(GenericCommand):
         __context_messages__ = []
         return
 
+
+@register_command
+class ListCommand(GenericCommand):
+    """gdb list but with syntax highlighted. """
+    _cmdline_ = "glist"
+    _syntax_ = "glist"
+    def __init__(self):
+        super(ListCommand, self).__init__(prefix=True)
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv):
+        try:
+            result = gdb.execute("list {}".format(" ".join(argv)), to_string=True)
+            symtabline = gdb.find_pc_line(current_arch.pc)
+            symtab = symtabline.symtab
+            fpath = symtab.fullname()
+            result = H.highlight_source_code(result, fpath)
+            gef_print(result)
+        except Exception as e:
+            err(str(e))
+
+@register_command
+class DisassembleCommand(GenericCommand):
+    """gdb disassemble but with syntax highlighted. """
+    _cmdline_ = "gdisassemble"
+    _syntax_ = "gdisassemble"
+    def __init__(self):
+        super(DisassembleCommand, self).__init__(prefix=True)
+        return
+
+    @only_if_gdb_running
+    def do_invoke(self, argv):
+        try:
+            result = gdb.execute("disassemble {}".format(" ".join(argv)), to_string=True)
+            result = H.highlight_gdb_disassemble(result)
+            gef_print(result)
+        except Exception as e:
+            err(str(e))
 
 @register_command
 class MemoryCommand(GenericCommand):
